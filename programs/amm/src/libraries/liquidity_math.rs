@@ -169,33 +169,25 @@ pub fn get_delta_amount_0_unsigned(
     liquidity: u128,
     round_up: bool,
 ) -> Result<u64> {
-    // sqrt_ratio_a_x64 should hold the smaller value
     if sqrt_ratio_a_x64 > sqrt_ratio_b_x64 {
         std::mem::swap(&mut sqrt_ratio_a_x64, &mut sqrt_ratio_b_x64);
     };
+    assert!(sqrt_ratio_a_x64 > 0);
 
     let numerator_1 = U256::from(liquidity) << fixed_point_64::RESOLUTION;
     let numerator_2 = U256::from(sqrt_ratio_b_x64 - sqrt_ratio_a_x64);
-
-    assert!(sqrt_ratio_a_x64 > 0);
+    let denominator = U256::from(sqrt_ratio_a_x64) * U256::from(sqrt_ratio_b_x64);
 
     let result = if round_up {
-        U256::div_rounding_up(
-            numerator_1
-                .mul_div_ceil(numerator_2, U256::from(sqrt_ratio_b_x64))
-                .unwrap(),
-            U256::from(sqrt_ratio_a_x64),
-        )
+        numerator_1.mul_div_ceil(numerator_2, denominator)
     } else {
-        numerator_1
-            .mul_div_floor(numerator_2, U256::from(sqrt_ratio_b_x64))
-            .unwrap()
-            / U256::from(sqrt_ratio_a_x64)
-    };
+        numerator_1.mul_div_floor(numerator_2, denominator)
+    }.ok_or(ErrorCode::MaxTokenOverflow)?;
+
     if result > U256::from(u64::MAX) {
         return Err(ErrorCode::MaxTokenOverflow.into());
     }
-    return Ok(result.as_u64());
+    Ok(result.as_u64())
 }
 
 /// Gets the delta amount_1 for given liquidity and price range
@@ -206,27 +198,27 @@ pub fn get_delta_amount_1_unsigned(
     liquidity: u128,
     round_up: bool,
 ) -> Result<u64> {
-    // sqrt_ratio_a_x64 should hold the smaller value
+    // Aseguramos que sqrt_ratio_a_x64 sea el valor menor
     if sqrt_ratio_a_x64 > sqrt_ratio_b_x64 {
         std::mem::swap(&mut sqrt_ratio_a_x64, &mut sqrt_ratio_b_x64);
     };
 
+    let liquidity_u256 = U256::from(liquidity);
+    let diff = U256::from(sqrt_ratio_b_x64 - sqrt_ratio_a_x64);
+    let denominator = U256::from(fixed_point_64::Q64);
+
     let result = if round_up {
-        U256::from(liquidity).mul_div_ceil(
-            U256::from(sqrt_ratio_b_x64 - sqrt_ratio_a_x64),
-            U256::from(fixed_point_64::Q64),
-        )
+        // Equivale a ceil(L * (sqrt_b - sqrt_a) / 2^64)
+        liquidity_u256.mul_div_ceil(diff, denominator)
     } else {
-        U256::from(liquidity).mul_div_floor(
-            U256::from(sqrt_ratio_b_x64 - sqrt_ratio_a_x64),
-            U256::from(fixed_point_64::Q64),
-        )
-    }
-    .unwrap();
+        // Equivale a floor(L * (sqrt_b - sqrt_a) / 2^64)
+        liquidity_u256.mul_div_floor(diff, denominator)
+    }.ok_or(ErrorCode::MaxTokenOverflow)?;
+
     if result > U256::from(u64::MAX) {
         return Err(ErrorCode::MaxTokenOverflow.into());
     }
-    return Ok(result.as_u64());
+    Ok(result.as_u64())
 }
 
 /// Helper function to get signed delta amount_0 for given liquidity and price range
