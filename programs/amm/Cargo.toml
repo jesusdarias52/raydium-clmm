@@ -19,6 +19,9 @@ no-log-ix-name = []
 enable-log = []
 devnet = []
 paramset = []
+# Client-side CU-model counters. Off by default; the deployed program is unaffected.
+# See src/libraries/cu_counters.rs.
+cu-counters = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]

@@ -49,6 +49,7 @@ pub fn get_next_sqrt_price_from_amount_0_rounding_up(
             };
         }
 
+        crate::libraries::cu_counters::note_div_u256(numerator_1, U256::from(sqrt_price_x64));
         U256::div_rounding_up(
             numerator_1,
             (numerator_1 / U256::from(sqrt_price_x64))
@@ -91,9 +92,19 @@ pub fn get_next_sqrt_price_from_amount_1_rounding_down(
     add: bool,
 ) -> u128 {
     if add {
+        // CU model: divisor is `liquidity` -- the axis that splits pools under 2^32 onto the
+        // short arm (168 CU) from wider ones onto long division (505 CU).
+        crate::libraries::cu_counters::note_div(
+            u128::from(amount) << fixed_point_64::RESOLUTION,
+            liquidity,
+        );
         let quotient = U256::from(u128::from(amount) << fixed_point_64::RESOLUTION) / liquidity;
         sqrt_price_x64.checked_add(quotient.as_u128()).unwrap()
     } else {
+        crate::libraries::cu_counters::note_div(
+            u128::from(amount) << fixed_point_64::RESOLUTION,
+            liquidity,
+        );
         let quotient = U256::div_rounding_up(
             U256::from(u128::from(amount) << fixed_point_64::RESOLUTION),
             U256::from(liquidity),

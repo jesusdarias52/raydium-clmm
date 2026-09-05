@@ -30,6 +30,11 @@ pub fn compute_swap_step(
     if is_base_input {
         // round up amount_in
         // In exact input case, amount_remaining is positive
+        // CU model: `mul_div_floor` divides by the fee denominator.
+        crate::libraries::cu_counters::note_div(
+            u128::from(amount_remaining) * u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
+            u128::from(FEE_RATE_DENOMINATOR_VALUE),
+        );
         let amount_remaining_less_fee = (amount_remaining as u64)
             .mul_div_floor(
                 (FEE_RATE_DENOMINATOR_VALUE - fee_rate).into(),
@@ -141,6 +146,11 @@ pub fn compute_swap_step(
                 .unwrap()
         } else {
             // take pip percentage as fee
+            // CU model: divisor is `1e6 - fee_rate`, not `1e6` -- a distinct traced operand.
+            crate::libraries::cu_counters::note_div(
+                u128::from(swap_step.amount_in) * u128::from(fee_rate),
+                u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
+            );
             swap_step
                 .amount_in
                 .mul_div_ceil(

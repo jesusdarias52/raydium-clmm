@@ -179,18 +179,20 @@ pub fn get_delta_amount_0_unsigned(
 
     assert!(sqrt_ratio_a_x64 > 0);
 
+    // CU model: the inner `mul_div` is a 256-bit division through a different routine and is
+    // not counted; the outer `/ sqrt_ratio_a` is the 128-bit one the trace attributes here.
     let result = if round_up {
-        U256::div_rounding_up(
-            numerator_1
-                .mul_div_ceil(numerator_2, U256::from(sqrt_ratio_b_x64))
-                .unwrap(),
-            U256::from(sqrt_ratio_a_x64),
-        )
+        let inner = numerator_1
+            .mul_div_ceil(numerator_2, U256::from(sqrt_ratio_b_x64))
+            .unwrap();
+        crate::libraries::cu_counters::note_div_u256(inner, U256::from(sqrt_ratio_a_x64));
+        U256::div_rounding_up(inner, U256::from(sqrt_ratio_a_x64))
     } else {
-        numerator_1
+        let inner = numerator_1
             .mul_div_floor(numerator_2, U256::from(sqrt_ratio_b_x64))
-            .unwrap()
-            / U256::from(sqrt_ratio_a_x64)
+            .unwrap();
+        crate::libraries::cu_counters::note_div_u256(inner, U256::from(sqrt_ratio_a_x64));
+        inner / U256::from(sqrt_ratio_a_x64)
     };
     if result > U256::from(u64::MAX) {
         return Err(ErrorCode::MaxTokenOverflow.into());

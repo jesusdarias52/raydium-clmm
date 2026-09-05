@@ -1,4 +1,5 @@
 pub mod big_num;
+pub mod cu_counters;
 pub mod fixed_point_64;
 pub mod full_math;
 pub mod liquidity_math;
