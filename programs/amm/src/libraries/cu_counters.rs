@@ -237,3 +237,34 @@ pub fn note_div_u256(numerator: crate::libraries::big_num::U256, denominator: cr
         note_div(numerator.as_u128(), denominator.as_u128());
     }
 }
+
+/// [`note_div`] for `U128::MAX / ratio` -- the positive-tick inversion in
+/// `tick_math::get_sqrt_price_at_tick`.
+///
+/// **The operands are not the ones the source writes.** `U128` is `uint`'s two-limb type, so a
+/// 128-by-64 division is done in two 64-bit steps and only the *second* reaches `__udivti3`:
+/// the first computes `u64::MAX / ratio` natively, and the second divides
+/// `(u64::MAX % ratio) << 64 | u64::MAX` by the same ratio. Read off the deployed bytecode at
+/// pc 0x20228..0x20233 and verified against 16 of 16 traced calls on
+/// `HwU4MRZ4mCZpH2SA`.
+///
+/// This is why the term is invisible to a caller: it fires once per positive-tick
+/// `get_sqrt_price_at_tick`, so a pool whose ticks are all negative never pays it, and one whose
+/// ticks are positive pays 635..751 CU per sub-step.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_u128_max_div(ratio: u128) {
+    #[cfg(feature = "cu-counters")]
+    {
+        if !enabled() || ratio == 0 {
+            return;
+        }
+        // A ratio of 64 bits or more takes a differently-shaped division; leave it uncounted
+        // rather than counted wrongly.
+        if ratio > u64::MAX as u128 {
+            return;
+        }
+        let rem = (u64::MAX as u128) % ratio;
+        note_div((rem << 64) | (u64::MAX as u128), ratio);
+    }
+}
