@@ -30,11 +30,18 @@ pub fn compute_swap_step(
     if is_base_input {
         // round up amount_in
         // In exact input case, amount_remaining is positive
-        // CU model: `mul_div_floor` divides by the fee denominator.
-        crate::libraries::cu_counters::note_div(
-            u128::from(amount_remaining) * u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
-            u128::from(FEE_RATE_DENOMINATOR_VALUE),
-        );
+        // CU model: `mul_div_floor` divides by the fee denominator -- but only count it when a
+        // fee is actually being taken on the input. Deployed `51fdba2` computes
+        // `amount_remaining_less_fee` only on its fee-on-input branch, while a caller replaying a
+        // fee-on-OUTPUT pool reaches this code with `fee_rate = 0` as a device to get a fee-free
+        // step. Counting that would report a division the chain never performs: measured on
+        // `4Jz82k6WHgf9UCyf`, exactly 56 phantom divisions over 56 sub-steps.
+        if fee_rate != 0 {
+            crate::libraries::cu_counters::note_div(
+                u128::from(amount_remaining) * u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
+                u128::from(FEE_RATE_DENOMINATOR_VALUE),
+            );
+        }
         let amount_remaining_less_fee = (amount_remaining as u64)
             .mul_div_floor(
                 (FEE_RATE_DENOMINATOR_VALUE - fee_rate).into(),
