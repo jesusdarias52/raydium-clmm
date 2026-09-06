@@ -11,6 +11,7 @@ name = "raydium_clmm"
 doctest = false
 
 [features]
+cu-counters = []
 no-entrypoint = []
 cpi = ["no-entrypoint"]
 default = []

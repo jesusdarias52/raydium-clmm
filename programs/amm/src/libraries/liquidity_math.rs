@@ -188,6 +188,15 @@ pub fn get_delta_amount_0_unsigned(
         .checked_mul(U256::from(sqrt_ratio_b_x64))
         .ok_or(ErrorCode::CalculateOverflow)?;
 
+    // CU model: **one** U256 division, against the single `sqrt_a * sqrt_b` denominator above.
+    // `a5a46ff` divided twice here (once by each sqrt), which is the largest single source of the
+    // division-count divergence between the vendored crate and the deployed program -- the client
+    // had to correct it with a signed per-sub-step term. Counted at the real dividend where it
+    // fits u128, which is the range the branch-path classifier is defined on.
+    crate::libraries::cu_counters::note_div_u256(
+        numerator_1.checked_mul(numerator_2).unwrap_or(numerator_1),
+        denominator,
+    );
     let result = if round_up {
         numerator_1.mul_div_ceil(numerator_2, denominator)
     } else {

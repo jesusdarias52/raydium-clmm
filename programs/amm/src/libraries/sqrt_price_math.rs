@@ -52,6 +52,9 @@ pub fn get_next_sqrt_price_from_amount_0_rounding_up(
             };
         }
 
+        // CU model: this `numerator_1 / sqrt_price` is a real U256 division and the widest
+        // operand pair in the swap. Counted where the chain performs it.
+        crate::libraries::cu_counters::note_div_u256(numerator_1, U256::from(sqrt_price_x64));
         Ok(U256::div_rounding_up(
             numerator_1,
             (numerator_1 / U256::from(sqrt_price_x64))
@@ -98,11 +101,22 @@ pub fn get_next_sqrt_price_from_amount_1_rounding_down(
     }
 
     if add {
+        // CU model: divisor is `liquidity` -- the axis that splits pools under 2^32 onto the
+        // short arm from wider ones onto long division. **U128 here on `51fdba2`**, where
+        // `a5a46ff` widened to U256; that difference is one whole `__udivti3` per sub-step.
+        crate::libraries::cu_counters::note_div(
+            u128::from(amount) << fixed_point_64::RESOLUTION,
+            liquidity,
+        );
         let quotient = (U128::from(amount) << fixed_point_64::RESOLUTION) / U128::from(liquidity);
         sqrt_price_x64
             .checked_add(quotient.as_u128())
             .ok_or(ErrorCode::CalculateOverflow.into())
     } else {
+        crate::libraries::cu_counters::note_div(
+            u128::from(amount) << fixed_point_64::RESOLUTION,
+            liquidity,
+        );
         let quotient = U128::div_rounding_up(
             U128::from(amount) << fixed_point_64::RESOLUTION,
             U128::from(liquidity),

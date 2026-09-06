@@ -123,6 +123,9 @@ pub fn get_sqrt_price_at_tick(tick: i32) -> Result<u128> {
 
     // Divide to obtain 1.0001^(2^(i - 1)) * 2^32 in numerator
     if tick > 0 {
+        // CU model: the second 64-bit step of this division is a real `__udivti3` and costs
+        // 635..751 CU. See `cu_counters::note_u128_max_div`.
+        crate::libraries::cu_counters::note_u128_max_div(ratio.as_u128());
         ratio = U128::MAX / ratio;
     }
 

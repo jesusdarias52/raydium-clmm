@@ -44,6 +44,15 @@ pub fn compute_swap(
     // fee-on-input; scale up for exact-output fee-on-output.
     let amount_for_price_calc = if is_base_input {
         if is_fee_on_input {
+            // CU model: one `__udivti3` by the fee denominator, performed only on the
+            // fee-on-input branch. The `a5a46ff` fork had to gate this on `fee_rate != 0`
+            // because a caller replaying a fee-on-OUTPUT pool reached the same code with a
+            // zero rate as a device; here the branch is real, so the count is too.
+            crate::libraries::cu_counters::note_div(
+                u128::from(amount_remaining)
+                    * u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
+                u128::from(FEE_RATE_DENOMINATOR_VALUE),
+            );
             amount_remaining
                 .mul_div_floor(
                     (FEE_RATE_DENOMINATOR_VALUE - fee_rate).into(),
@@ -137,6 +146,11 @@ pub fn compute_swap(
                     .checked_sub(result.amount_in)
                     .ok_or(ErrorCode::CalculateOverflow)?;
             } else {
+                // CU model: divisor is `1e6 - fee_rate`, a distinct traced operand from `1e6`.
+                crate::libraries::cu_counters::note_div(
+                    u128::from(result.amount_in) * u128::from(fee_rate),
+                    u128::from(FEE_RATE_DENOMINATOR_VALUE - fee_rate),
+                );
                 result.fee_amount = result
                     .amount_in
                     .mul_div_ceil(
@@ -148,6 +162,13 @@ pub fn compute_swap(
         } else {
             // Fee from output: result.amount_out is gross output, fee is calculated from gross output
             // fee = gross_output * fee_rate / FEE_RATE_DENOMINATOR
+            // CU model: this division does not exist in `a5a46ff` at all -- it is the second
+            // `/1e6` the deployed program performs on a fee-on-output pool, and the client had
+            // to replay it by hand.
+            crate::libraries::cu_counters::note_div(
+                u128::from(result.amount_out) * u128::from(fee_rate),
+                u128::from(FEE_RATE_DENOMINATOR_VALUE),
+            );
             result.fee_amount = result
                 .amount_out
                 .mul_div_ceil(fee_rate.into(), FEE_RATE_DENOMINATOR_VALUE.into())
