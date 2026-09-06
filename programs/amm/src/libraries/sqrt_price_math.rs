@@ -104,18 +104,18 @@ pub fn get_next_sqrt_price_from_amount_1_rounding_down(
         // CU model: divisor is `liquidity` -- the axis that splits pools under 2^32 onto the
         // short arm from wider ones onto long division. **U128 here on `51fdba2`**, where
         // `a5a46ff` widened to U256; that difference is one whole `__udivti3` per sub-step.
-        crate::libraries::cu_counters::note_div(
-            u128::from(amount) << fixed_point_64::RESOLUTION,
-            liquidity,
+        crate::libraries::cu_counters::note_div_u128(
+            U128::from(amount) << fixed_point_64::RESOLUTION,
+            U128::from(liquidity),
         );
         let quotient = (U128::from(amount) << fixed_point_64::RESOLUTION) / U128::from(liquidity);
         sqrt_price_x64
             .checked_add(quotient.as_u128())
             .ok_or(ErrorCode::CalculateOverflow.into())
     } else {
-        crate::libraries::cu_counters::note_div(
-            u128::from(amount) << fixed_point_64::RESOLUTION,
-            liquidity,
+        crate::libraries::cu_counters::note_div_u128(
+            U128::from(amount) << fixed_point_64::RESOLUTION,
+            U128::from(liquidity),
         );
         let quotient = U128::div_rounding_up(
             U128::from(amount) << fixed_point_64::RESOLUTION,

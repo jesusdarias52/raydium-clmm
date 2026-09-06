@@ -272,6 +272,26 @@ pub fn get_delta_amounts_for_swap(
         .checked_mul(U256::from(sqrt_ratio_b_x64))
         .ok_or(ErrorCode::CalculateOverflow)?;
 
+    // CU model: **this** is the swap's widest division, and it is the one the client's model was
+    // blind to. `compute_swap` calls this function, never `get_delta_amount_0_unsigned`, so the
+    // counter sited there never fired on a swap at all. `sqrt_price_product` needs two limbs, so
+    // `uint` divides it by Knuth and reaches `__udivti3` once per quotient limb -- traced at two
+    // calls costing 813 CU on `ABk1rvmb` against 552 on `4Jz82k`, i.e. 261 CU per sub-step of
+    // pure per-pool operand width. `note_div_u256` replays the limb loop; the operands below are
+    // the ones `mul_pow2_div_{ceil,floor}` actually divides, including `ceil`'s `+ denom - 1`.
+    #[cfg(feature = "cu-counters")]
+    if amount_1_x64.leading_zeros() >= 64 {
+        let shifted = amount_1_x64 << 64usize;
+        let numerator = if zero_for_one {
+            shifted.checked_add(sqrt_price_product - U256::from(1u8))
+        } else {
+            Some(shifted)
+        };
+        if let Some(numerator) = numerator {
+            crate::libraries::cu_counters::note_div_u256(numerator, sqrt_price_product);
+        }
+    }
+
     let (amount_in_u256, amount_out_u256) = if zero_for_one {
         let amount_in = mul_pow2_div_ceil(amount_1_x64, 64, sqrt_price_product)
             .ok_or(ErrorCode::CalculateOverflow)?;

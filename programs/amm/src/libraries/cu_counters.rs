@@ -182,6 +182,54 @@ pub fn udiv_path(duo: u128, div: u128) -> usize {
 #[cfg(all(test, feature = "cu-counters"))]
 mod tests {
     use super::*;
+    use crate::libraries::big_num::U256;
+
+    /// The limb replay must reproduce `uint`'s own quotient, or the windows it hands
+    /// [`note_div`] describe divisions the chain never performs. Both shapes are covered:
+    /// `div_mod_small` (divisor under 2^64) and `div_mod_knuth`, including the D3 refinement
+    /// and the D6 add-back, which do not divide but do move the running remainder.
+    #[test]
+    fn the_limb_replay_reproduces_uints_own_quotient() {
+        let cases: [(U256, U256); 8] = [
+            (U256::from(1u128 << 100), U256::from(3u128)),
+            (U256::from(u128::MAX), U256::from(1u128 << 64)),
+            // the swap's widest division: `L * dsqrt << 64` over `sqrt_a * sqrt_b`
+            (
+                U256::from(369_220_455_397u128) * U256::from(44_000_000_000_000u128) << 64usize,
+                U256::from(87_895_387_825_834_134u128) * U256::from(87_895_387_825_834_200u128),
+            ),
+            (U256::from(u128::MAX) << 64usize, U256::from(u128::MAX)),
+            (U256::from(u128::MAX) << 100usize, U256::from(7u128 << 90)),
+            (U256::from(5u128), U256::from(7u128)),
+            (U256::from(1u128 << 127), U256::from(1u128 << 63)),
+            (U256::MAX, U256::from(1u128 << 65) + U256::from(1u8)),
+        ];
+        let prev = set_enabled(true);
+        for (num, den) in cases {
+            let q = note_wide_div(&num.0, &den.0);
+            let mut got = U256::zero();
+            for (i, limb) in q.iter().take(4).enumerate() {
+                got = got + (U256::from(*limb) << (64 * i));
+            }
+            assert_eq!(got, num / den, "num {num} den {den}");
+        }
+        set_enabled(prev);
+    }
+
+    /// The count is the point: `uint` reaches the runtime's division routine once per quotient
+    /// limb, and it is that multiplicity the model was blind to. Traced on `ABk1rvmb`, the
+    /// swap's `sqrt_a * sqrt_b` division is **two** `__udivti3` calls.
+    #[test]
+    fn the_widest_swap_division_is_two_calls_against_the_normalised_top_limb() {
+        let num = U256::from(369_220_455_397u128) * U256::from(44_000_000_000_000u128) << 64usize;
+        let den = U256::from(87_895_387_825_834_134u128) * U256::from(87_895_387_825_834_200u128);
+        let prev = set_enabled(true);
+        let before = snapshot();
+        note_div_u256(num, den);
+        let after = snapshot().since(&before);
+        set_enabled(prev);
+        assert_eq!(after.divisions, 2, "one q_hat estimate per quotient limb");
+    }
 
     /// Every branch of the trifecta port, on operands built to select it. Verbatim from the
     /// Orca fork's own test, so the two ports cannot drift apart silently. The indices are the
@@ -219,23 +267,182 @@ mod tests {
     }
 }
 
-/// [`note_div`] for a division this source performs on [`U256`] values.
+/// Note every `__udivti3` one wide division performs, by replaying `uint`'s own algorithm.
 ///
-/// The vendored library widens to `U256` at several sites where the deployed program divides
-/// natively in 128 bits; the *operands* are the same numbers, so the path is the same. A pair
-/// that genuinely does not fit in `u128` is a 256-bit division through a different routine and
-/// is deliberately **not** counted here — it is not in the consumer's cost table.
+/// **A `U256 / U256` is not one `__udivti3`.** `uint::construct_uint!` divides limb by limb, and
+/// each limb step is a `div_mod_word(hi, lo, y)` — a real `u128 / u128`, so a single source-level
+/// `/` reaches the runtime's division routine once per *quotient limb*. Counting it as one
+/// division is what left the deployed program's widest per-sub-step division uncounted: traced
+/// on two dynamic-fee pools it is **two** calls costing 813 and 552 CU respectively, a 261 CU
+/// per-sub-step spread that is pure per-pool operand width.
+///
+/// The replay follows `uint-0.9.5`'s `div_mod`, which has three shapes:
+///
+/// - `numerator < denominator` — early return, **no division at all**.
+/// - `denominator < 2^64` — `div_mod_small`: one `div_mod_word` per limb, top down. The **top**
+///   limb's step is not counted: its `hi` is the literal `0`, so `(0 << 64) | lo` is a
+///   zero-extended `u64` and LLVM narrows the division to 64 bits. Confirmed on the trace — the
+///   LP-fee-growth division (`remaining << 64 / liquidity`, a two-limb `U128`) reaches
+///   `__udivti3` exactly **once** per sub-step, not twice.
+/// - otherwise — `div_mod_knuth`: one `q_hat` estimate per quotient limb, each dividing a
+///   128-bit window of the *normalized* running remainder by the divisor's normalized top limb.
+///   That top limb is what a trace sees as the divisor, and it is why the observed divisor of
+///   this swap's widest division is `(sqrt_a * sqrt_b) >> 49` rather than either sqrt price
+///   (verified to four significant figures on `ABk1rvmb`).
+///
+/// The Knuth windows are computed in closed form rather than by simulating D4/D6: before digit
+/// `j` the algorithm holds `P_{j+1} mod V` where `P_k = floor(U / 2^(64k))` and `U`, `V` are the
+/// shift-normalized operands, so the dividend is `(P_{j+1} mod V) >> 64(n-2)`. No correction
+/// step divides, so nothing else has to be modelled.
 #[inline]
 #[allow(unused_variables)]
 pub fn note_div_u256(numerator: crate::libraries::big_num::U256, denominator: crate::libraries::big_num::U256) {
     #[cfg(feature = "cu-counters")]
     {
-        use crate::libraries::big_num::U256;
-        if numerator > U256::from(u128::MAX) || denominator > U256::from(u128::MAX) {
+        if !enabled() {
             return;
         }
-        note_div(numerator.as_u128(), denominator.as_u128());
+        let _ = note_wide_div(&numerator.0, &denominator.0);
     }
+}
+
+/// [`note_div_u256`] for a two-limb `U128`.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_div_u128(numerator: crate::libraries::big_num::U128, denominator: crate::libraries::big_num::U128) {
+    #[cfg(feature = "cu-counters")]
+    {
+        if !enabled() {
+            return;
+        }
+        let _ = note_wide_div(&numerator.0, &denominator.0);
+    }
+}
+
+/// The limb-by-limb replay behind [`note_div_u256`], over `uint`'s own little-endian limbs.
+///
+/// Faithful to `uint-0.9.5`: `div_mod_small` for a divisor under 2^64, otherwise Algorithm D
+/// with the same normalization, the same two-step `q_hat` correction and the same D6 add-back.
+/// The corrections do not divide, but they change the running remainder, so a replay that
+/// skipped them would feed the *next* digit a wrong window.
+#[cfg(feature = "cu-counters")]
+fn note_wide_div(num: &[u64], den: &[u64]) -> [u64; 10] {
+    const MAX: usize = 10;
+    let mut quotient = [0u64; MAX];
+    let w = num.len();
+    debug_assert!(w <= 8 && w == den.len());
+    let bits = |v: &[u64]| -> usize {
+        for i in (0..v.len()).rev() {
+            if v[i] != 0 {
+                return i * 64 + (64 - v[i].leading_zeros() as usize);
+            }
+        }
+        0
+    };
+    let my_bits = bits(num);
+    let your_bits = bits(den);
+    // Dividing by zero, or by something larger than us: `div_mod` returns before dividing.
+    if your_bits == 0 || my_bits < your_bits {
+        return quotient;
+    }
+
+    if your_bits <= 64 {
+        // `div_mod_small`: one `div_mod_word` per limb, top down. The **top** limb's step is not
+        // counted -- its `hi` is the literal `0`, so `(0 << 64) | lo` is a zero-extended `u64`
+        // and the division narrows to 64 bits. Confirmed on the trace: the LP-fee-growth
+        // division (a two-limb `U128`) reaches `__udivti3` exactly once per sub-step, not twice.
+        let y = u128::from(den[0]);
+        let mut rem = u128::from(num[w - 1]) % y;
+        for i in (0..w - 1).rev() {
+            let x = (rem << 64) | u128::from(num[i]);
+            note_div(x, y);
+            quotient[i] = (x / y) as u64;
+            rem = x % y;
+        }
+        quotient[w - 1] = num[w - 1] / (y as u64);
+        return quotient;
+    }
+
+    // `div_mod_knuth`.
+    let words = |b: usize| 1 + (b - 1) / 64;
+    let n = words(your_bits);
+    let m = words(my_bits) - n;
+    let shift = den[n - 1].leading_zeros();
+
+    // D1: normalize. `v` cannot grow a limb -- `shift` is exactly the room above its top limb --
+    // but `u` can, which is why `full_shl` returns one limb more than the type holds.
+    let mut v = [0u64; MAX];
+    let mut u = [0u64; MAX];
+    if shift == 0 {
+        v[..w].copy_from_slice(den);
+        u[..w].copy_from_slice(num);
+    } else {
+        for i in 0..w {
+            v[i] = (den[i] << shift) | if i == 0 { 0 } else { den[i - 1] >> (64 - shift) };
+            u[i] = (num[i] << shift) | if i == 0 { 0 } else { num[i - 1] >> (64 - shift) };
+        }
+        u[w] = num[w - 1] >> (64 - shift);
+    }
+    let v_n_1 = v[n - 1];
+    let v_n_2 = v[n - 2];
+
+    // D2..D7: one quotient digit per iteration, each estimating `q_hat` with a single
+    // `div_mod_word` -- the only division in the whole algorithm.
+    for j in (0..=m).rev() {
+        let u_jn = u[j + n];
+        let mut q_hat = if u_jn < v_n_1 {
+            let x = (u128::from(u_jn) << 64) | u128::from(u[j + n - 1]);
+            note_div(x, u128::from(v_n_1));
+            let mut q = (x / u128::from(v_n_1)) as u64;
+            let mut r = (x % u128::from(v_n_1)) as u64;
+            // D3's refinement: at most two iterations, and it does not divide.
+            loop {
+                let prod = u128::from(q) * u128::from(v_n_2);
+                let (hi, lo) = ((prod >> 64) as u64, prod as u64);
+                if (hi, lo) <= (r, u[j + n - 2]) {
+                    break;
+                }
+                q -= 1;
+                let (nr, ov) = r.overflowing_add(v_n_1);
+                r = nr;
+                if ov {
+                    break;
+                }
+            }
+            q
+        } else {
+            u64::MAX
+        };
+
+        // D4: u[j..j+n+1] -= q_hat * v[..n]
+        let mut borrow = 0u64;
+        let mut carry = 0u64;
+        for i in 0..n {
+            let p = u128::from(q_hat) * u128::from(v[i]) + u128::from(carry);
+            carry = (p >> 64) as u64;
+            let (t, b1) = u[j + i].overflowing_sub(p as u64);
+            let (t, b2) = t.overflowing_sub(borrow);
+            u[j + i] = t;
+            borrow = u64::from(b1 || b2);
+        }
+        let (t, b1) = u[j + n].overflowing_sub(carry);
+        let (t, b2) = t.overflowing_sub(borrow);
+        u[j + n] = t;
+
+        // D6: the estimate was one too high (~2^-63), so add `v` back.
+        if b1 || b2 {
+            q_hat -= 1;
+            let mut c = 0u64;
+            for i in 0..n {
+                let sum = u128::from(u[j + i]) + u128::from(v[i]) + u128::from(c);
+                u[j + i] = sum as u64;
+                c = (sum >> 64) as u64;
+            }
+            u[j + n] = u[j + n].wrapping_add(c);
+        }
+        quotient[j] = q_hat;
+    }
+    quotient
 }
 
 /// [`note_div`] for `U128::MAX / ratio` -- the positive-tick inversion in
