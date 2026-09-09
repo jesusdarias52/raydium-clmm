@@ -184,6 +184,10 @@ pub fn get_delta_amount_0_unsigned(
     // Single `sqrt_a * sqrt_b` denominator: one U256 division instead of two.
     // Identity `floor(floor(X/b)/c) == floor(X/(b*c))` (and ceil counterpart)
     // makes this exact-equivalent to the prior two-step form.
+    crate::libraries::cu_counters::note_mul_u256(
+        U256::from(sqrt_ratio_a_x64),
+        U256::from(sqrt_ratio_b_x64),
+    );
     let denominator = U256::from(sqrt_ratio_a_x64)
         .checked_mul(U256::from(sqrt_ratio_b_x64))
         .ok_or(ErrorCode::CalculateOverflow)?;
@@ -265,9 +269,18 @@ pub fn get_delta_amounts_for_swap(
     //   amount_0 = amount_1_x64 · Q64 / sqrt_price_product   (ceil for input, floor for output)
     //   amount_1 = amount_1_x64 / Q64                         (ceil for input, floor for output)
     let sqrt_price_diff = sqrt_ratio_b_x64 - sqrt_ratio_a_x64;
+    // CU model: `U256::checked_mul` is `uint_full_mul_reg!` at `n_words = 4`, where the macro
+    // installs no skip predicate -- 16 limb products, one `__multi3` each, unconditionally. These
+    // two are the multiplications `compute_swap` actually reaches; the `mul_div` sites below only
+    // run on the overflow path. See `cu_counters::note_mul`.
+    crate::libraries::cu_counters::note_mul_u256(U256::from(liquidity), U256::from(sqrt_price_diff));
     let amount_1_x64 = U256::from(liquidity)
         .checked_mul(U256::from(sqrt_price_diff))
         .ok_or(ErrorCode::CalculateOverflow)?;
+    crate::libraries::cu_counters::note_mul_u256(
+        U256::from(sqrt_ratio_a_x64),
+        U256::from(sqrt_ratio_b_x64),
+    );
     let sqrt_price_product = U256::from(sqrt_ratio_a_x64)
         .checked_mul(U256::from(sqrt_ratio_b_x64))
         .ok_or(ErrorCode::CalculateOverflow)?;
@@ -279,18 +292,8 @@ pub fn get_delta_amounts_for_swap(
     // calls costing 813 CU on `ABk1rvmb` against 552 on `4Jz82k`, i.e. 261 CU per sub-step of
     // pure per-pool operand width. `note_div_u256` replays the limb loop; the operands below are
     // the ones `mul_pow2_div_{ceil,floor}` actually divides, including `ceil`'s `+ denom - 1`.
-    #[cfg(feature = "cu-counters")]
-    if amount_1_x64.leading_zeros() >= 64 {
-        let shifted = amount_1_x64 << 64usize;
-        let numerator = if zero_for_one {
-            shifted.checked_add(sqrt_price_product - U256::from(1u8))
-        } else {
-            Some(shifted)
-        };
-        if let Some(numerator) = numerator {
-            crate::libraries::cu_counters::note_div_u256(numerator, sqrt_price_product);
-        }
-    }
+    // (The caller-side replay that used to sit here is gone: `mul_pow2_div_{ceil,floor}` now
+    // counts both of its branches itself, which is the only way the slow one gets counted at all.)
 
     let (amount_in_u256, amount_out_u256) = if zero_for_one {
         let amount_in = mul_pow2_div_ceil(amount_1_x64, 64, sqrt_price_product)

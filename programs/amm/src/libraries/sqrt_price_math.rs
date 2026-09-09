@@ -1,4 +1,4 @@
-use super::full_math::MulDiv;
+use super::full_math::{MulDiv, Upcast512};
 use super::tick_math;
 use super::unsafe_math::UnsafeMathTrait;
 use super::{fixed_point_64, U128, U256};
@@ -30,6 +30,27 @@ use anchor_lang::prelude::*;
 /// √P' = √P * L / L'
 /// √P' = √P * L / (L + Δx*√P)
 ///
+/// Count the `mul_div_ceil` a price solve performs — the multiply, and then whichever division
+/// `MulDiv for U256` reaches. **This was uncounted**, and on `zero_for_one` it is the swap's
+/// widest Knuth division: a register trace of a one-step sell finds `pc 132391` entered five
+/// times against three counted, and the two extra are this call's quotient limbs.
+#[inline]
+fn note_mul_div_ceil(x: U256, num: U256, denom: U256) {
+    crate::libraries::cu_counters::note_mul_u256(x, num);
+    let (prod, overflow) = x.overflowing_mul(num);
+    if !overflow {
+        if let Some(n) = prod.checked_add(denom - U256::from(1u8)) {
+            crate::libraries::cu_counters::note_div_u256(n, denom);
+            return;
+        }
+    }
+    crate::libraries::cu_counters::note_mul_u512(x.as_u512(), num.as_u512());
+    crate::libraries::cu_counters::note_div_u512(
+        x.as_u512() * num.as_u512() + (denom - U256::from(1u8)).as_u512(),
+        denom.as_u512(),
+    );
+}
+
 pub fn get_next_sqrt_price_from_amount_0_rounding_up(
     sqrt_price_x64: u128,
     liquidity: u128,
@@ -42,9 +63,11 @@ pub fn get_next_sqrt_price_from_amount_0_rounding_up(
     let numerator_1 = U256::from(liquidity) << fixed_point_64::RESOLUTION;
 
     if add {
+        crate::libraries::cu_counters::note_mul_u256(U256::from(amount), U256::from(sqrt_price_x64));
         if let Some(product) = U256::from(amount).checked_mul(U256::from(sqrt_price_x64)) {
             let denominator = numerator_1 + product;
             if denominator >= numerator_1 {
+                note_mul_div_ceil(numerator_1, U256::from(sqrt_price_x64), denominator);
                 return Ok(numerator_1
                     .mul_div_ceil(U256::from(sqrt_price_x64), denominator)
                     .ok_or(ErrorCode::CalculateOverflow)?
@@ -63,12 +86,14 @@ pub fn get_next_sqrt_price_from_amount_0_rounding_up(
         )
         .as_u128())
     } else {
+        crate::libraries::cu_counters::note_mul_u256(U256::from(amount), U256::from(sqrt_price_x64));
         let product = U256::from(amount)
             .checked_mul(U256::from(sqrt_price_x64))
             .ok_or(ErrorCode::CalculateOverflow)?;
         let denominator = numerator_1
             .checked_sub(product)
             .ok_or(ErrorCode::CalculateOverflow)?;
+        note_mul_div_ceil(numerator_1, U256::from(sqrt_price_x64), denominator);
         Ok(numerator_1
             .mul_div_ceil(U256::from(sqrt_price_x64), denominator)
             .ok_or(ErrorCode::CalculateOverflow)?

@@ -35,10 +35,28 @@ pub struct SwapCounters {
     /// Divisions offered to [`note_div`], whether or not they classified — a tripwire against
     /// an instrumented site being dropped by a future edit.
     pub divisions: u32,
+    /// Limb products (`u64 x u64 -> u128`) the swap's wide multiplications executed. Each one is
+    /// a `__multi3` call on SBF. See [`note_mul`] for why the count is not `n^2`.
+    pub mul_products: u32,
+    /// Wide multiplications offered to [`note_mul`] — the same tripwire as `divisions`.
+    pub multiplications: u32,
+    /// Limb products executed **inside `uint`'s division**, kept apart from `mul_products`.
+    ///
+    /// These are `__multi3` calls too, but they happen inside `__udivti3`'s own frame, and the
+    /// consumer prices that frame whole from a traced arm table — so a model that charges
+    /// `mul_products` must NOT see them or it bills every division's internals twice. They were
+    /// folded into `mul_products` until 2026-09-07, which made that field unusable as the unit
+    /// for a per-`__multi3` charge: on the 4,438-row walkless population cell it correlates with
+    /// the estimate's error at **r = −0.106** and charging it at the traced 52.88 CU/call takes
+    /// that cell's band 3,902 → 4,944, because its whole variation there is division internals
+    /// the arm table already paid for.
+    pub div_mul_products: u32,
 }
 
 impl SwapCounters {
-    pub const ZERO: Self = Self { udiv_paths: [0; UDIV_PATHS], divisions: 0 };
+    pub const ZERO: Self =
+        Self { udiv_paths: [0; UDIV_PATHS], divisions: 0, mul_products: 0, multiplications: 0,
+               div_mul_products: 0 };
 
     /// This counter set less `base`, saturating — the shape a caller wants when it brackets one
     /// `swap` inside a longer-lived process.
@@ -48,6 +66,9 @@ impl SwapCounters {
             out.udiv_paths[i] = self.udiv_paths[i].saturating_sub(base.udiv_paths[i]);
         }
         out.divisions = self.divisions.saturating_sub(base.divisions);
+        out.mul_products = self.mul_products.saturating_sub(base.mul_products);
+        out.multiplications = self.multiplications.saturating_sub(base.multiplications);
+        out.div_mul_products = self.div_mul_products.saturating_sub(base.div_mul_products);
         out
     }
 }
@@ -101,6 +122,236 @@ pub fn note_div(numerator: u128, denominator: u128) {
             c.divisions = c.divisions.saturating_add(1);
         });
     }
+}
+
+/// Record one wide multiplication, counted in **limb products** rather than in calls.
+///
+/// `uint`'s `uint_full_mul_reg!` is a doubly-unrolled `n x n` loop of `u64 x u64 -> u128`, and on
+/// SBF each of those is one `__multi3` (43.9 instructions, plus a nine-instruction wrapper). What
+/// makes the count vary is a detail of the macro that is easy to miss: the skip predicate
+/// `|a, b| a != 0 || b != 0` — testing the **first** operand's limb `me[j]` and the running carry,
+/// never the second operand — is installed **only for `n_words = 8`**. At every other width the
+/// macro is invoked with `|_, _| true` and all `n^2` products run unconditionally.
+///
+/// So a `U256 x U256` is always 16 products and a `U512 x U512` is `8 x (nonzero limbs of the
+/// first operand)` plus a carry tail — which is why `MulDiv for U256`'s overflow path, whose first
+/// operand is `liquidity << 64`, costs 8 products on a pool with `liquidity < 2^64` and 16 on a
+/// wider one. Traced on the deployed program, `pc 131859` runs 7..9 products on one side of that
+/// boundary and 14..18 on the other, and `pc 132725` runs exactly 16 every time.
+///
+/// The accumulator is replayed rather than approximated because the carry decides the tail: a
+/// product whose `me[j]` is zero still runs when the previous one carried.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_mul(me: &[u64], you: &[u64]) {
+    #[cfg(feature = "cu-counters")]
+    {
+        if !enabled() {
+            return;
+        }
+        let n = me.len();
+        debug_assert_eq!(n, you.len());
+        // `uint` installs the skip predicate at this width and nowhere else.
+        let skipping = n == 8;
+        let mut ret = [0u64; 16];   // widest caller is U512; no allocation on the quote path
+        let mut products = 0u32;
+        for i in 0..n {
+            let b = you[i];
+            let mut carry = 0u64;
+            for j in 0..n {
+                if skipping && me[j] == 0 && carry == 0 {
+                    continue;
+                }
+                products += 1;
+                let a = me[j];
+                let full = (a as u128) * (b as u128);
+                let (hi, low) = ((full >> 64) as u64, full as u64);
+                let overflow = {
+                    let existing_low = &mut ret[i + j];
+                    let (low, o) = low.overflowing_add(*existing_low);
+                    *existing_low = low;
+                    o
+                };
+                carry = {
+                    let existing_hi = &mut ret[i + j + 1];
+                    let hi = hi.wrapping_add(overflow as u64);
+                    let (hi, o0) = hi.overflowing_add(carry);
+                    let (hi, o1) = hi.overflowing_add(*existing_hi);
+                    *existing_hi = hi;
+                    (o0 | o1) as u64
+                };
+            }
+        }
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.mul_products = c.mul_products.saturating_add(products);
+            c.multiplications = c.multiplications.saturating_add(1);
+        });
+    }
+}
+
+/// Limb products `uint`'s **division** executes, and why they are not free.
+///
+/// `uint`'s `div_mod` takes a fast `div_mod_small` path only when the divisor fits one word; on a
+/// two-limb divisor — which every `sqrt_a * sqrt_b` denominator in this swap is — it runs Knuth
+/// Algorithm D, and each of its `m + 1` outer iterations does a `full_mul_u64` (`n_words` limb
+/// products) plus one more per q-hat correction. So a division carries **15..18 `__multi3` calls**
+/// on a four-word dividend and 5..9 on a two-word one, on top of the `__udivti3` calls
+/// [`note_div_u256`] already counts. Traced, that is `pc 131859`: 7..9 products on one side of the
+/// operand-width boundary and 14..18 on the other, three calls per sell step.
+///
+/// A faithful port of `uint-0.9.5`'s `div_mod` / `div_mod_knuth` rather than an estimate, because
+/// the correction count is data-dependent and is exactly the part that moves.
+#[cfg(feature = "cu-counters")]
+fn knuth_mul_products(num: &[u64], den: &[u64]) -> u32 {
+    fn bits(w: &[u64]) -> usize {
+        for i in (0..w.len()).rev() {
+            if w[i] != 0 {
+                return i * 64 + (64 - w[i].leading_zeros() as usize);
+            }
+        }
+        0
+    }
+    fn div_mod_word(hi: u64, lo: u64, y: u64) -> (u64, u64) {
+        let d = ((hi as u128) << 64) | lo as u128;
+        ((d / y as u128) as u64, (d % y as u128) as u64)
+    }
+    let nw = num.len();
+    let (db, sb) = (bits(den), bits(num));
+    if db == 0 || sb < db {
+        return 0; // divide-by-zero, or quotient 0 -- neither reaches Knuth
+    }
+    if db <= 64 {
+        return 0; // div_mod_small: word-at-a-time, no multiplication
+    }
+    let words = |b: usize| 1 + (b - 1) / 64;
+    let n = words(db);
+    let m = words(sb) - n;
+    // D1: normalise so the divisor's top word has its 64th bit set.
+    let shift = den[n - 1].leading_zeros() as usize;
+    let shl = |w: &[u64], s: usize, extra: usize| -> ([u64; 9], usize) {
+        let len = w.len() + extra;
+        let mut out = [0u64; 9];
+        if s == 0 {
+            out[..w.len()].copy_from_slice(w);
+        } else {
+            for i in 0..w.len() {
+                out[i] |= w[i] << s;
+                // `uint` shifts the divisor in place and discards the top bits; normalisation
+                // guarantees nothing is lost, so a missing high word is correct, not a bug.
+                if i + 1 < len {
+                    out[i + 1] |= w[i] >> (64 - s);
+                }
+            }
+        }
+        (out, len)
+    };
+    let (v, _) = shl(den, shift, 0);
+    let (mut u, _) = shl(num, shift, 1);
+    let (v_n_1, v_n_2) = (v[n - 1], v[n - 2]);
+    let mut products = 0u32;
+    for j in (0..=m).rev() {
+        let u_jn = u[j + n];
+        let mut q_hat = if u_jn < v_n_1 {
+            let (mut q, mut r) = div_mod_word(u_jn, u[j + n - 1], v_n_1);
+            // Knuth's Theorem B bounds this at two iterations *given* the algorithm's
+            // preconditions; the bound is explicit so a caller that violates them (an operand
+            // pair this replay was never meant to see) cannot spin.
+            for _ in 0..3 {
+                // D3's correction test -- one `u64 x u64 -> u128` each time round.
+                products += 1;
+                let p = (q as u128) * (v_n_2 as u128);
+                if ((p >> 64) as u64, p as u64) <= (r, u[j + n - 2]) {
+                    break;
+                }
+                q -= 1;
+                let (nr, o) = r.overflowing_add(v_n_1);
+                r = nr;
+                if o {
+                    break;
+                }
+            }
+            q
+        } else {
+            u64::MAX
+        };
+        // D4: `full_mul_u64` is one product per limb of the divisor's whole width.
+        products += nw as u32;
+        let mut qv = [0u64; 9];
+        let mut carry = 0u64;
+        for i in 0..nw {
+            let p = (v.get(i).copied().unwrap_or(0) as u128) * (q_hat as u128) + carry as u128;
+            qv[i] = p as u64;
+            carry = (p >> 64) as u64;
+        }
+        qv[nw] = carry;
+        // D5/D6: subtract, and on the (rare) overflow add the divisor back.
+        let mut borrow = 0u64;
+        for i in 0..=n {
+            let (a, b1) = u[j + i].overflowing_sub(qv[i]);
+            let (a, b2) = a.overflowing_sub(borrow);
+            u[j + i] = a;
+            borrow = (b1 | b2) as u64;
+        }
+        if borrow != 0 {
+            q_hat = q_hat.wrapping_sub(1);
+            let mut c = 0u64;
+            for i in 0..n {
+                let (a, o1) = u[j + i].overflowing_add(v[i]);
+                let (a, o2) = a.overflowing_add(c);
+                u[j + i] = a;
+                c = (o1 | o2) as u64;
+            }
+            u[j + n] = u[j + n].wrapping_add(c);
+        }
+    }
+    products
+}
+
+/// Record the limb products one `U256 / U256` performs inside `uint`'s Knuth division.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_div_mul_u256(
+    numerator: crate::libraries::big_num::U256,
+    denominator: crate::libraries::big_num::U256,
+) {
+    #[cfg(feature = "cu-counters")]
+    {
+        if !enabled() {
+            return;
+        }
+        let p = knuth_mul_products(&numerator.0, &denominator.0);
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.div_mul_products = c.div_mul_products.saturating_add(p);
+        });
+    }
+}
+
+/// [`note_mul`] for a `U256` pair — the width `MulDiv for U256` multiplies before it knows whether
+/// the product overflows.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_mul_u256(a: crate::libraries::big_num::U256, b: crate::libraries::big_num::U256) {
+    #[cfg(feature = "cu-counters")]
+    note_mul(&a.0, &b.0);
+}
+
+/// [`note_mul`] for the `U512` pair `MulDiv for U256` falls through to on overflow. This is the
+/// one whose product count moves with the operands.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_mul_u512(a: crate::libraries::big_num::U512, b: crate::libraries::big_num::U512) {
+    #[cfg(feature = "cu-counters")]
+    note_mul(&a.0, &b.0);
+}
+
+/// [`note_mul`] for a two-limb `U128` pair.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_mul_u128(a: crate::libraries::big_num::U128, b: crate::libraries::big_num::U128) {
+    #[cfg(feature = "cu-counters")]
+    note_mul(&a.0, &b.0);
 }
 
 /// Which branch path Rust's `compiler_builtins` `u128` division takes on these operands.
@@ -303,6 +554,36 @@ pub fn note_div_u256(numerator: crate::libraries::big_num::U256, denominator: cr
             return;
         }
         let _ = note_wide_div(&numerator.0, &denominator.0);
+        // A wide division also multiplies: `uint` runs Knuth Algorithm D whenever the divisor
+        // needs more than one word, and each outer iteration costs `n_words` limb products plus
+        // its q-hat corrections. Counted here rather than at the call sites so the two halves of
+        // one division can never drift apart. See `knuth_mul_products`.
+        let p = knuth_mul_products(&numerator.0, &denominator.0);
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.div_mul_products = c.div_mul_products.saturating_add(p);
+        });
+    }
+}
+
+/// [`note_div_u256`] for the `U512` pair `MulDiv for U256` falls through to on overflow.
+#[inline]
+#[allow(unused_variables)]
+pub fn note_div_u512(
+    numerator: crate::libraries::big_num::U512,
+    denominator: crate::libraries::big_num::U512,
+) {
+    #[cfg(feature = "cu-counters")]
+    {
+        if !enabled() {
+            return;
+        }
+        let _ = note_wide_div(&numerator.0, &denominator.0);
+        let p = knuth_mul_products(&numerator.0, &denominator.0);
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.div_mul_products = c.div_mul_products.saturating_add(p);
+        });
     }
 }
 
@@ -316,6 +597,12 @@ pub fn note_div_u128(numerator: crate::libraries::big_num::U128, denominator: cr
             return;
         }
         let _ = note_wide_div(&numerator.0, &denominator.0);
+        // Same Knuth multiplies as `note_div_u256`, at two limbs.
+        let p = knuth_mul_products(&numerator.0, &denominator.0);
+        COUNTERS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.div_mul_products = c.div_mul_products.saturating_add(p);
+        });
     }
 }
 

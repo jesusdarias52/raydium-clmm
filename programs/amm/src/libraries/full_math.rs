@@ -130,6 +130,7 @@ impl MulDiv for u64 {
         if denom == 0 {
             return None;
         }
+        crate::libraries::cu_counters::note_mul_u128(U128::from(self), U128::from(num));
         let r = (U128::from(self) * U128::from(num)) / U128::from(denom);
         if r > U128::from(u64::MAX) {
             None
@@ -142,6 +143,7 @@ impl MulDiv for u64 {
         if denom == 0 {
             return None;
         }
+        crate::libraries::cu_counters::note_mul_u128(U128::from(self), U128::from(num));
         let r = (U128::from(self) * U128::from(num) + U128::from(denom - 1)) / U128::from(denom);
         if r > U128::from(u64::MAX) {
             None
@@ -162,10 +164,15 @@ impl MulDiv for U128 {
         if denom.is_zero() {
             return None;
         }
+        // CU model: `overflowing_mul` is `uint_full_mul_reg!` at this width, and the macro
+        // installs no skip predicate below `n_words = 8`, so this is a fixed `n^2` limb products
+        // on **every** call — the floor of what a `mul_div` costs. Counted where it happens.
+        crate::libraries::cu_counters::note_mul(&self.0, &num.0);
         let (prod, overflow) = self.overflowing_mul(num);
         if !overflow {
             return Some(prod / denom);
         }
+        crate::libraries::cu_counters::note_mul_u256(self.as_u256(), num.as_u256());
         let r = ((self.as_u256()) * (num.as_u256())) / (denom.as_u256());
         if r > U128::MAX.as_u256() {
             None
@@ -178,12 +185,17 @@ impl MulDiv for U128 {
         if denom.is_zero() {
             return None;
         }
+        // CU model: `overflowing_mul` is `uint_full_mul_reg!` at this width, and the macro
+        // installs no skip predicate below `n_words = 8`, so this is a fixed `n^2` limb products
+        // on **every** call — the floor of what a `mul_div` costs. Counted where it happens.
+        crate::libraries::cu_counters::note_mul(&self.0, &num.0);
         let (prod, overflow) = self.overflowing_mul(num);
         if !overflow {
             if let Some(numerator) = prod.checked_add(denom - 1) {
                 return Some(numerator / denom);
             }
         }
+        crate::libraries::cu_counters::note_mul_u256(self.as_u256(), num.as_u256());
         let r = (self.as_u256() * num.as_u256() + (denom - 1).as_u256()) / denom.as_u256();
         if r > U128::MAX.as_u256() {
             None
@@ -208,10 +220,15 @@ impl MulDiv for U256 {
         if denom.is_zero() {
             return None;
         }
+        // CU model: `overflowing_mul` is `uint_full_mul_reg!` at this width, and the macro
+        // installs no skip predicate below `n_words = 8`, so this is a fixed `n^2` limb products
+        // on **every** call — the floor of what a `mul_div` costs. Counted where it happens.
+        crate::libraries::cu_counters::note_mul(&self.0, &num.0);
         let (prod, overflow) = self.overflowing_mul(num);
         if !overflow {
             return Some(prod / denom);
         }
+        crate::libraries::cu_counters::note_mul_u512(self.as_u512(), num.as_u512());
         let r = (self.as_u512() * num.as_u512()) / denom.as_u512();
         if r > U256::MAX.as_u512() {
             None
@@ -224,12 +241,17 @@ impl MulDiv for U256 {
         if denom.is_zero() {
             return None;
         }
+        // CU model: `overflowing_mul` is `uint_full_mul_reg!` at this width, and the macro
+        // installs no skip predicate below `n_words = 8`, so this is a fixed `n^2` limb products
+        // on **every** call — the floor of what a `mul_div` costs. Counted where it happens.
+        crate::libraries::cu_counters::note_mul(&self.0, &num.0);
         let (prod, overflow) = self.overflowing_mul(num);
         if !overflow {
             if let Some(numerator) = prod.checked_add(denom - 1) {
                 return Some(numerator / denom);
             }
         }
+        crate::libraries::cu_counters::note_mul_u512(self.as_u512(), num.as_u512());
         let r = (self.as_u512() * num.as_u512() + (denom - 1).as_u512()) / denom.as_u512();
         if r > U256::MAX.as_u512() {
             None
@@ -255,10 +277,28 @@ pub fn mul_pow2_div_ceil(x: U256, shift: u32, denom: U256) -> Option<U256> {
     if x.leading_zeros() >= shift {
         let shifted = x << (shift as usize);
         if let Some(numerator) = shifted.checked_add(denom - U256::from(1u8)) {
+            // CU model: counted here rather than at the call site, so the fast and slow branches
+            // cannot be counted differently by accident. The caller used to replay only this
+            // branch, which left the `mul_div_ceil` below — and every `__udivti3` inside it —
+            // uncounted on exactly the pools whose numerator does not fit the shift.
+            crate::libraries::cu_counters::note_div_u256(numerator, denom);
             return Some(numerator / denom);
         }
     }
-    x.mul_div_ceil(U256::from(1u128) << (shift as usize), denom)
+    let num = U256::from(1u128) << (shift as usize);
+    crate::libraries::cu_counters::note_mul_u256(x, num);
+    if let (prod, false) = x.overflowing_mul(num) {
+        if let Some(numerator) = prod.checked_add(denom - U256::from(1u8)) {
+            crate::libraries::cu_counters::note_div_u256(numerator, denom);
+        }
+    } else {
+        crate::libraries::cu_counters::note_mul_u512(x.as_u512(), num.as_u512());
+        crate::libraries::cu_counters::note_div_u512(
+            x.as_u512() * num.as_u512() + (denom - U256::from(1u8)).as_u512(),
+            denom.as_u512(),
+        );
+    }
+    x.mul_div_ceil(num, denom)
 }
 
 #[inline]
@@ -268,9 +308,18 @@ pub fn mul_pow2_div_floor(x: U256, shift: u32, denom: U256) -> Option<U256> {
     }
     if x.leading_zeros() >= shift {
         let shifted = x << (shift as usize);
+        crate::libraries::cu_counters::note_div_u256(shifted, denom);
         return Some(shifted / denom);
     }
-    x.mul_div_floor(U256::from(1u128) << (shift as usize), denom)
+    let num = U256::from(1u128) << (shift as usize);
+    crate::libraries::cu_counters::note_mul_u256(x, num);
+    if let (prod, false) = x.overflowing_mul(num) {
+        crate::libraries::cu_counters::note_div_u256(prod, denom);
+    } else {
+        crate::libraries::cu_counters::note_mul_u512(x.as_u512(), num.as_u512());
+        crate::libraries::cu_counters::note_div_u512(x.as_u512() * num.as_u512(), denom.as_u512());
+    }
+    x.mul_div_floor(num, denom)
 }
 
 #[cfg(test)]

@@ -242,11 +242,17 @@ impl SwapState {
         let fee_u128 = fee_amont as u128;
 
         let protocol_fee_delta = if protocol_fee_rate > 0 {
+            // CU model: a real `__udivti3` per step, and it was counted nowhere -- `swap_math`'s
+            // notes stop at `compute_swap`, and this runs in `swap_internal` afterwards. It is
+            // one of the three divisions a register trace finds beyond the counted histogram on
+            // every sell (`pc 27330` / `pc 27270` / the fee-growth site below).
+            crate::libraries::cu_counters::note_div(fee_u128 * protocol_fee_rate as u128, denom);
             (fee_u128 * protocol_fee_rate as u128 / denom) as u64
         } else {
             0
         };
         let fund_fee_delta = if fund_fee_rate > 0 {
+            crate::libraries::cu_counters::note_div(fee_u128 * fund_fee_rate as u128, denom);
             (fee_u128 * fund_fee_rate as u128 / denom) as u64
         } else {
             0
@@ -271,6 +277,13 @@ impl SwapState {
             .ok_or(ErrorCode::CalculateOverflow)?;
 
         if self.liquidity > 0 {
+            // CU model: the LP fee-growth division -- `remaining_fee << 64 / liquidity`, whose
+            // divisor is pool state, so its branch path is a per-pool quantity. Traced at
+            // `pc 131635` with a two-limb dividend and previously uncounted.
+            crate::libraries::cu_counters::note_div_u128(
+                U128::from(remaining_fee) * U128::from(fixed_point_64::Q64),
+                U128::from(self.liquidity),
+            );
             let fee_growth_global_x64_delta = U128::from(remaining_fee)
                 .mul_div_floor(U128::from(fixed_point_64::Q64), U128::from(self.liquidity))
                 .ok_or(ErrorCode::CalculateOverflow)?
